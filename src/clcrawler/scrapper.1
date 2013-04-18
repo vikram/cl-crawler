@@ -1,0 +1,458 @@
+(in-package :com.crawler)
+
+(defscan *template-scanner*
+    (list :sequence
+          (list :GREEDY-REPETITION 1 NIL `(:char-class ,@(map1-n #'(lambda (i) (code-char (+ 190 i))) 50)))))
+
+(defun run-template (template str)
+  (reduce #'(lambda (x y)
+              (cl-ppcre:regex-replace-all (cl-ppcre:quote-meta-chars (cdr y)) x (car y)))
+          template
+          :initial-value str))
+
+(defun ext-template (template str)
+  (remove-if #'string-empty
+             (cl-ppcre:split *template-scanner*
+                             (run-template template str))))
+
+(defun template-id (id)
+  (format nil "~A" (code-char (+ 190 (incf id)))))
+
+(let ((i 0))
+  (defun get-next-template-id ()
+    (when (> i 48)
+      (setf i 0))
+    (template-id (incf i))))
+
+(defun istag (token)
+  (char= #\: (char token 0)))
+
+(defun html-tokens (str)
+  (let ((res '()))
+    (dolist (token (remove-empty-string (html-scanner-preserve-space str)))
+      (if (istag token)
+          (push token res)
+          (dolist (l (letter-tokenizer token))
+            (push l res))))
+    (nreverse res)))
+
+(defun lcs(Str1 sTr2 &key (tokenizer #'html-tokens))
+  (let* ((s1 (funcall tokenizer str1))
+         (s2 (funcall tokenizer str2))
+         (m (length s1))
+         (n (length s2))
+         (L (make-array `(,(1+ m) ,(1+ n)) :initial-element 0))
+         (lcs '())
+         (longest 0))
+    (dotimes (i m)
+      (dotimes (j n)
+        (when (string= (nth i s1)
+                       (nth j s2))
+          (let ((v (1+ (aref l i j))))
+            (setf (aref L (1+ i) (1+ j)) v)
+            (when (> v longest)
+              (setf longest v)
+              (setf lcs '()))
+            (when (= v longest)
+              (push (join-tokens (subseq s1 (1+ (- i v)) (1+ i))) lcs))))))
+    lcs))
+
+(defun join-tokens (tokens)
+  (let ((results '())
+        (temp '()))
+    (dolist (token tokens)
+      (if (> (length token) 1)
+          (progn
+            (push (join (nreverse temp) "") results)
+            (setf temp '())
+            (push token results))
+          (push token temp)))
+    (push (join (nreverse temp) "") results)
+    (remove-empty-string (nreverse results))))
+
+(defun join-temp (lst)
+  (let ((str '()))
+    (dolist (token lst)
+      (push token str)
+      (when (istag token)
+        (push " " str)))
+    (join (flatten (nreverse str)) "")))
+
+(defun join-template (lst)
+  (let ((str '()))
+    (dolist (item lst)
+      (let ((temp '()))
+        (dolist (token (cdr item))
+          (push token temp)
+          (when (istag token)
+            (push " " temp)))
+        (push (cons (car item) (join (nreverse temp) "")) str)))
+    (nreverse str)))
+
+(defun learn-template (str1 str2 &key (tokenizer #'html-tokens) (template nil))
+  (let ((i (length template)))
+    (while-bind (common-lst (first (lcs str1 str2 :tokenizer tokenizer)))
+      (let ((common (join-temp common-lst)))
+        (if (and (string/= common "")
+                 (or (> (length common) 1)
+                     (punctuation common)))
+            (let ((sym (template-id (incf i))))
+              (when (not (template-scanner common))
+                (push (cons sym common-lst) template)
+                (print common)
+                (setf str1 (cl-ppcre:regex-replace-all (cl-ppcre:quote-meta-chars common) str1 sym))
+                (setf str2 (cl-ppcre:regex-replace-all (cl-ppcre:quote-meta-chars common) str2 sym))
+                (print str1)))
+            (return))))
+    (nreverse template)))
+
+(defun analyze-template (template str)
+  (let ((res '())
+        (state nil)) ;either alpha/numeric/tag/template
+    (dolist (letter (letter-tokenizer
+                     (run-template
+                      (join-template template)
+                      str)))
+      (if (template-scanner letter)
+          (progn
+            (when state
+              (push state res))
+            (setf state letter))
+          (awhen (casefn letter
+                         (numeric-p 'numeric)
+                         (alpha-p 'alpha)
+                         (whitespace-scanner 'whitespace)
+                         (punctuation 'punctuation)
+                         (tag-scanner 'tag)
+                         (identity 'unknown))
+            (unless (eql state it)
+              (unless (eql state 'whitespace)
+                (push state res)
+                (setf state it))))))
+    (push state res)
+    (flatten
+     (mapcar
+      #'(lambda (token)
+          (aif (assoc token template :test #'equal)
+               (cdr it)
+               token))
+      (nreverse res)))))
+
+(defun template (str)
+  (let ((res '())
+        (state nil))
+    (dolist (letter (letter-tokenizer str))
+      (if (template-scanner letter)
+          (progn
+            (when state
+              (push state res))
+            (setf state letter))
+          (awhen (casefn letter
+                         (numeric-p 'numeric)
+                         (alpha-p 'alpha)
+                         (whitespace-scanner 'whitespace)
+                         (punctuation (cons 'punctuation letter))
+                         (tag-scanner 'tag)
+                         (identity 'unknown))
+            (push state res)
+            (setf state it))))
+    (push state res)
+    (cons str
+          (remove-empty (nreverse res)))))
+
+(defun merge-conseq (lst &optional (acc '()) (last nil))
+  (if (null lst)
+      (nreverse acc)
+      (if (equal (first lst) last)
+          (merge-conseq (cdr lst) (cons (cons (first lst) :many+) (rest acc)) (first lst))
+          (merge-conseq (cdr lst) (cons (first lst) acc) (first lst)))))
+
+(defun learn-template-seq (strings &key (tokenizer #'html-scanner-preserve-space))
+  (let* ((bags (permutations strings))
+         (templates
+          (mapcar #'(lambda (bag)
+                      (learn-template (first bag) (second bag) :tokenizer tokenizer))
+                  bags))
+         (analysis
+          (mapcar #'(lambda (template)
+                      (analyze-template template (first strings)))
+                  templates))
+         (f (freqs analysis :test #'equal)))
+    (print analysis)
+    (richest-template f)))
+
+(defun richest-template (analyzed-templates)
+  (caar
+   (first
+    (sort
+     (mapcar
+      #'(lambda (template)
+          (cons template
+                (- (length (car template)) (length (remove-symbols (car template))))))
+      analyzed-templates)
+     #'>
+     :key #'cdr))))
+
+(defparameter *patterns*
+  `((:time . ,(cl-ppcre:create-scanner "[0-9]?[0-9]:[0-9][0-9]"))
+    (:num . ,(cl-ppcre:create-scanner "[0-9]+"))
+    (:mins . ,(cl-ppcre:create-scanner "[0-9]+ mins" :case-insensitive-mode t))
+    (:date . ,(cl-ppcre:create-scanner "[0-9]+[ ]?[a-z]{0,2} (jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]+" :case-insensitive-mode t))
+    (:day . ,(cl-ppcre:create-scanner "(monday|tuesday|wednesday|thursday|friday|saturday|sunday|mo|tu|we|th|fr|sa|su|mon|tue|wed|thu|fri|sat|sun)" :case-insensitive-mode t))))
+
+(defun elmtext (page q)
+  (let ((scanner (if (stringp q)
+                     (cl-ppcre:create-scanner q)
+                     (cdr (assoc (second q) *patterns*)))))
+    (with-tags (text page)
+      (when (eql (type-of text) 'stp:text)
+        (aif (cl-ppcre:all-matches scanner (trim (stp:data text)))
+             (return (list (tag-path text)
+                           (template-pattern it (trim (stp:data text))))))))))
+
+(defun template-pattern (matches str)
+  (let ((len (length str)))
+    (if (= len (clast matches))
+        (get-next-template-id)
+        (if (= 2 (length matches))
+            (merge-conseq (template
+             (join (list (subseq str 0 (first matches))
+                         (get-next-template-id)
+                         (subseq str (second matches)))
+                   "")))
+            (replace-chain
+             str
+             (mapcar
+              #'(lambda (x) (cons (subseq str (first x) (second x)) (get-next-template-id)))
+              (groupn matches 2)))))))
+
+(defun learn-from-example (url example)
+  (let ((page (fetch-while-empty url (make-hash-code url))))
+    (when page
+      (run-example example (prune-fluff page)))))
+
+(defun eg-pattern-p (q)
+  (and (symbolp (first q))
+       (symbolp (second q))
+       (eql :pattern (first q))))
+
+(defun eg-record-p (q)
+  (and (symbolp (first q))
+       (symbolp (second q))))
+
+(defun eg-field-p (q)
+  (and (listp q)
+       (symbolp (first q))
+       (or (stringp (second q))
+           (and
+            (listp (second q))
+            (eql :pattern (car (second q)))))
+       (null (third q))))
+
+(defun eg-fields-p (q)
+  (and (listp q)
+       (null (remove-if #'listp q))))
+
+(defun eg-many-p (q)
+  (eql (first q) :loop))
+
+(defun run-example (q page)
+  (if (not q)
+      nil
+      (if (eg-many-p q)
+          (list :loop (run-example (second q) page))
+          (if (eg-field-p q)
+              (list :field (first q) (second q) (elmtext page (second q)))
+              (if (eg-record-p q)
+                  (append (list :record (second q))
+                          (run-example (rest (rest q)) page))
+                  (if (eg-fields-p q)
+                      (mapcar #'(lambda (x) (run-example x page)) q)
+                      (cons :error q)))))))
+
+;need to do 1st, next and last to figure out pattern for the lists
+;and need to make sure templates are represented in the same string
+(defparameter *test-example1*
+  (learn-from-example
+   "http://www.showcasecinemas.co.uk/listings/showcase_printable.php?wantedSite=lbi"
+   '(:record :cinema
+     (:name "Showcase Cinemas Leeds")
+     (:loop
+       (:first
+        (:record :film
+                 (:name "Hancock")
+                 (:rating "12A")
+                 (:duration (:pattern :mins "92 mins"))
+                 (:loop
+                  (:first
+                   (:record :day-listing
+                            (:day (:pattern :date "10th July"))
+                            (:loop
+                             (:first
+                              (:record :time
+                                       (:time (:pattern :time "11:30"))))
+                             (:next
+                              (:record :time
+                                       (:time (:pattern :time "12:05"))))
+                             (:last
+                              (:record :time
+                                       (:time (:pattern :time "10:35")))))))
+                  (:next
+                   (:record :day-listing
+                            (:day (:pattern :date "11th July")))
+                   :as-above)
+                  (:last
+                   (:record :day-listing
+                            (:day (:pattern :date "17th July"))
+                            :as-above)))))
+       (:next
+        (:record :film
+                 (:name "Kung Fu Panda")
+                 (:rating "PG")
+                 (:duration (:pattern :mins "92 mins"))
+                 :as-above))
+       (:last
+        (:record :film
+                 (:name "What Happens In Vegas")
+                 (:rating "12A")
+                 (:duration (:pattern :mins "98 mins"))
+                 :as-above))))))
+
+(defparameter *test-example0*
+  (learn-from-example
+   "http://www.showcasecinemas.co.uk/listings/showcase_printable.php?wantedSite=lbi"
+   '(:record :cinema
+     (:name "Showcase Cinemas Leeds")
+     (:loop
+      (:record :film
+       (:name "Hancock")
+       (:rating "12A")
+       (:duration (:pattern :mins "92 mins"))
+       (:loop
+        (:record :day-listing
+		 (:day (:pattern :day "Thursday"))
+                 (:date (:pattern :date "10th July"))
+                 (:loop
+                  (:record :time
+                           (:time (:pattern :time "11:30")))))))))))
+
+(defparameter *test-example2*
+  (learn-template-from-example
+   "http://www.showcasecinemas.co.uk/listings/showcase_printable.php?wantedSite=lbi"
+   '(:record :cinema
+     (:name "Showcase Cinemas Leeds")
+     (:phone "0871 220 1000")
+     (:loop
+      (:record :film
+       (:name "Hancock")
+       (:rating "12A")
+       (:duration (:pattern :mins "92 mins"))
+       (:loop
+        (:record :day-listing
+                 (:day (:pattern :day "Thursday"))
+                 (:date (:pattern :date "10th July"))
+                 (:loop
+                  (:record :time
+                           (:time (:pattern :time "11:30")))))))))))
+
+(defun elmpattern (page q)
+  (let ((scanner (if (stringp q)
+                     (cl-ppcre:create-scanner q)
+                     (cl-ppcre:create-scanner (third q)))))
+    (aif (cl-ppcre:all-matches scanner page)
+         (template-pattern it page))))
+
+(defun learn-template-from-example (url example)
+  (let ((tokens (whitespace-splitter (get-page-text/tokens-for-url url)))
+        (token-pos -1)
+        (template '()))
+    (labels ((next-token ()
+               (nth (incf token-pos) tokens))
+             (parse-example (q)
+               (if (not q)
+                   nil
+                   (if (eg-many-p q)
+                       (list :loop (parse-example (second q)))
+                       (if (eg-field-p q)
+                           (list :field (first q) (second q))
+                           (if (eg-record-p q)
+                               (append (list :record (second q))
+                                       (parse-example (rest (rest q))))
+                               (if (eg-fields-p q)
+                                   (mapcar #'(lambda (x) (parse-example x)) q)
+                                   (cons :error q))))))))
+      (parse-example example))))
+
+
+(defun eg-text (data q)
+  (let ((scanner (if (stringp q)
+                     (cl-ppcre:create-scanner q)
+                     (cdr (assoc (second q) *patterns*)))))
+    (aif (cl-ppcre:all-matches scanner (trim data))
+         (template-pattern it (trim data)))))
+
+(defun runny-example (example page)
+  (let ((wrapper '()))
+    (labels ((parse-example (q data)
+        (if (not q)
+            nil
+            (if (eg-many-p q)
+                (list :loop (parse-example (second q) data))
+                (if (eg-field-p q)
+                    (list :field (first q) (second q) (eg-text data (second q)))
+                    (if (eg-record-p q)
+                        (append (list :record (second q))
+                                (parse-example (rest (rest q)) data))
+                        (if (eg-fields-p q)
+                            (mapcar #'(lambda (x) (parse-example x data)) q)
+                            (cons :error q))))))))
+      (with-tags (tag (prune-fluff page))
+        (when (eql (type-of tag) 'stp:text)
+          (multiple-value-bind (found template rest-example)
+              (parse-example example (stp:data tag))
+            (when found
+              (setf example rest-example)
+              (push (cons (tag-path tag) template) wrapper)))))
+        wrapper)))
+
+(defun learny-from-example (url example)
+  (let ((page (fetch-while-empty url (make-hash-code url))))
+    (when page
+      (awhen (tag-html page)
+        (runny-example example it it)))))
+
+(defun learn-template-from-example (url example)
+  (let* ((page (get-page-text/tokens-for-url url))
+         (tokens (whitespace-splitter page))
+         (token-pos -1)
+         (wrapper page))
+    (labels ((next-token ()
+               (nth (incf token-pos) tokens))
+             (current-token ()
+               (if (= -1 token-pos)
+                   (next-token)
+                   (nth token-pos tokens)))
+             (previous-token ()
+               (if (> token-pos 0)
+                   (nth token-pos tokens)
+                   ""))
+             (parse-field (q)
+               (let* ((str (or (and (stringp q) q) (third q)))
+                      (scanner (cl-ppcre:create-scanner str)))
+                 (awhen (cl-ppcre:all-matches scanner page)
+                   (let ((template (get-next-template-id)))
+                     (list (first it) (second it) template)))))
+             (parse-example (q)
+               (if (not q)
+                   nil
+                   (if (eg-many-p q)
+                       (list :loop (parse-example (second q)))
+                       (if (eg-field-p q)
+                           (list :field (first q) (second q) (parse-field (second q)))
+                           (if (eg-record-p q)
+                               (append (list :record (second q))
+                                       (parse-example (rest (rest q))))
+                               (if (eg-fields-p q)
+                                   (mapcar #'(lambda (x) (parse-example x)) q)
+                                   (cons :error q))))))))
+      (parse-example example))))
